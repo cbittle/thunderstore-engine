@@ -89,6 +89,14 @@ pub(crate) fn full_name_prefix(s: &str) -> &str {
   }
 }
 
+/// Splits `Owner-Name-Version` into its name and version, if it has one.
+pub(crate) fn split_version(s: &str) -> Option<(&str, &str)> {
+  let name = full_name_prefix(s);
+  let version = s.get(name.len() + 1..)?;
+
+  (!version.is_empty()).then_some((name, version))
+}
+
 /// Whether `source` and `dest` name the same file on disk, following symlinks
 /// and resolving `.`/`..` so a differently spelled path to the identical file
 /// is recognized, not merely a similarly spelled one.
@@ -216,5 +224,17 @@ mod tests {
     );
     assert_eq!(full_name_prefix("NoHyphen"), "NoHyphen");
     assert_eq!(full_name_prefix(""), "");
+  }
+
+  #[test]
+  fn split_version_variants() {
+    assert_eq!(
+      split_version("Owner-Name-1.2.3"),
+      Some(("Owner-Name", "1.2.3"))
+    );
+    assert_eq!(split_version("Owner-Name"), None);
+    assert_eq!(split_version("Owner-Name-"), None);
+    assert_eq!(split_version("NoHyphen"), None);
+    assert_eq!(split_version(""), None);
   }
 }

@@ -4,7 +4,8 @@
 //! game-agnostic. See [`DependencyGraph`](crate::models::DependencyGraph) for the algorithm.
 //!
 //! Resolution is version-agnostic: dependency version suffixes are ignored and
-//! every package resolves to its latest available version. See
+//! every package resolves to its latest available version unless requested as
+//! `Owner-Name-Version`. See
 //! [`DependencyGraph::resolve`](crate::models::DependencyGraph::resolve) for the
 //! full limitation.
 
