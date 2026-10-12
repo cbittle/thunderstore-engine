@@ -259,7 +259,7 @@ fn import_in_routes_a_file_path_and_a_directory_from_the_source_string_alone() {
   assert_eq!(outcome.installed, vec!["Author-CoolMod".to_string()]);
   assert!(outcome.unchanged.is_empty());
   assert!(outcome.reinstalled.is_empty());
-  assert!(!outcome.source.preserves_versions());
+  assert!(outcome.source.preserves_versions());
   assert!(
     from_file
       .join("BepInEx/plugins/Author-CoolMod/CoolMod.dll")
@@ -1558,4 +1558,126 @@ fn adopt_names_in_reports_a_failed_upgrade_only_as_failed() {
 
   dl.assert();
   idx.assert();
+}
+
+/// `Author-CoolMod` 1.0.0 and 2.0.0 (latest).
+fn index_json_two_versions(server_url: &str) -> String {
+  let version = |number: &str, file: &str, created: &str| {
+    format!(
+      r#"{{"name":"CoolMod","full_name":"Author-CoolMod","description":"A cool mod","icon":"icon.png","version_number":"{number}","dependencies":[],"download_url":"{server_url}/dl/{file}","downloads":1,"date_created":"{created}","website_url":"","is_active":true,"uuid4":"ver-{number}","file_size":1024}}"#
+    )
+  };
+
+  format!(
+    r#"[{{"name":"CoolMod","full_name":"Author-CoolMod","owner":"Author","package_url":"https://example.com/CoolMod","date_created":"2024-01-01T12:00:00Z","date_updated":"2024-01-02T12:00:00Z","uuid4":"pkg","rating_score":1,"is_pinned":false,"is_deprecated":false,"has_nsfw_content":false,"categories":[],"versions":[{},{}]}}]"#,
+    version("2.0.0", "mod-2.zip", "2024-01-02T12:00:00Z"),
+    version("1.0.0", "mod-1.zip", "2024-01-01T12:00:00Z"),
+  )
+}
+
+/// A bare `.r2x` naming `Author-CoolMod` at `version_number`.
+fn export_at(index: &thunderstore_engine::models::PackageIndex, version_number: &str) -> String {
+  let mut version = index
+    .get_package_by_full_name("Author-CoolMod")
+    .unwrap()
+    .versions
+    .into_iter()
+    .find(|v| v.version_number.as_deref() == Some("1.0.0"))
+    .unwrap();
+
+  version.version_number = Some(version_number.to_string());
+
+  let entry = profile::mod_entry_from_version("Author-CoolMod", "Author", &version, 1);
+  let export = profile::portability::export_format_from_mods("Pinned", &[entry]);
+
+  profile::portability::export_r2x_to_string(&export).unwrap()
+}
+
+#[test]
+fn import_installs_the_exported_version_not_the_latest() {
+  let mut server = Server::new();
+
+  let old_dl = server
+    .mock("GET", "/dl/mod-1.zip")
+    .with_status(200)
+    .with_body(build_mod_zip())
+    .expect(1)
+    .create();
+  let new_dl = server
+    .mock("GET", "/dl/mod-2.zip")
+    .with_status(200)
+    .with_body(build_mod_zip())
+    .expect(0)
+    .create();
+  let _idx = server
+    .mock("GET", "/pkg/")
+    .with_status(200)
+    .with_header("Content-Type", "application/json")
+    .with_header("Last-Modified", "Wed, 21 Feb 2024 15:30:45 GMT")
+    .with_body(index_json_two_versions(&server.url()))
+    .create();
+
+  let cache = tempdir().unwrap();
+  let base = tempdir().unwrap();
+
+  let client = ThunderstoreClient::builder()
+    .package_index_url(format!("{}/pkg/", server.url()))
+    .base_url(server.url())
+    .cache_dir(cache.path())
+    .build()
+    .unwrap();
+
+  let rt = Runtime::new().unwrap();
+  let eco = Ecosystem::bundled();
+  let index = rt.block_on(client.get_manifest()).unwrap();
+
+  let target = base.path().join("target");
+  let imported = rt
+    .block_on(profile::portability::import_r2z_in(
+      &target,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      export_at(&index, "1.0.0").as_bytes(),
+      1,
+    ))
+    .unwrap();
+
+  assert_eq!(imported.installed, vec!["Author-CoolMod".to_string()]);
+
+  let recorded = profile::modlist::read(&target).unwrap();
+
+  assert_eq!(recorded.len(), 1);
+  assert_eq!(recorded[0].version_number.to_string(), "1.0.0");
+
+  let missing = base.path().join("missing");
+  let error = rt
+    .block_on(profile::portability::import_r2z_in(
+      &missing,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      export_at(&index, "9.9.9").as_bytes(),
+      2,
+    ))
+    .unwrap_err();
+
+  assert!(
+    error
+      .to_string()
+      .contains("Author-CoolMod has no version 9.9.9"),
+    "{error}"
+  );
+  assert!(
+    profile::modlist::read(&missing)
+      .unwrap_or_default()
+      .is_empty()
+  );
+
+  old_dl.assert();
+  new_dl.assert();
 }
