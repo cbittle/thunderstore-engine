@@ -648,9 +648,20 @@ async fn install_one(
     .pins(pins.iter().cloned())
     .resolve_report(index);
 
+  // A pinned version the package does not publish stops resolution before any
+  // dependency is reached, so the request itself is the only entry.
+  if let [unresolved] = resolution.unresolved.as_slice()
+    && unresolved == full_name
+    && let Some((name, version)) = crate::util::split_version(full_name)
+  {
+    return Err(Error::Profile(format!(
+      "cannot install {full_name}: {name} has no version {version}"
+    )));
+  }
+
   if !resolution.unresolved.is_empty() {
     return Err(Error::Profile(format!(
-      "cannot install {full_name}: unresolved dependencies: {}",
+      "cannot install {full_name}: could not resolve {}",
       resolution.unresolved.join(", ")
     )));
   }
@@ -2359,47 +2370,9 @@ mod tests {
         }
       }
 
-      /// Serves each package's archive and returns an index in which that
-      /// version is the only, and so the latest, one.
+      /// Serves each package's archive and returns an index of them. Versions of
+      /// one package are published in slice order, so the last is the latest.
       fn publish(&mut self, pkgs: &[Pkg<'_>]) -> PackageIndex {
-        let mut packages = Vec::new();
-
-        for pkg in pkgs {
-          let path = format!("/dl/{}-{}.zip", pkg.full_name, pkg.version);
-          let mock = self
-            .server
-            .mock("GET", path.as_str())
-            .with_status(200)
-            .with_header("Content-Type", "application/zip")
-            .with_body(zip_of(pkg.files))
-            .create();
-
-          self.mocks.push(mock);
-
-          let (owner, name) = pkg.full_name.split_once('-').unwrap();
-          let json = serde_json::json!({
-            "name": name, "full_name": pkg.full_name, "owner": owner,
-            "package_url": "https://example.com", "date_created": "2024-01-01T12:00:00Z",
-            "date_updated": "2024-01-02T12:00:00Z", "uuid4": "pkg", "rating_score": 1,
-            "is_pinned": false, "is_deprecated": false, "has_nsfw_content": false,
-            "categories": [],
-            "versions": [{
-              "name": name, "full_name": pkg.full_name, "description": "d", "icon": "i",
-              "version_number": pkg.version, "dependencies": pkg.deps,
-              "download_url": format!("{}{path}", self.server.url()), "downloads": 1,
-              "date_created": "2024-01-01T12:00:00Z", "website_url": "", "is_active": true,
-              "uuid4": "ver", "file_size": 1
-            }]
-          });
-
-          packages.push(serde_json::from_value::<Package>(json).unwrap());
-        }
-
-        PackageIndex::from(packages)
-      }
-
-      /// Like [`Self::publish`], with several versions per package.
-      fn publish_history(&mut self, pkgs: &[Pkg<'_>]) -> PackageIndex {
         let mut packages: Vec<serde_json::Value> = Vec::new();
 
         for (day, pkg) in pkgs.iter().enumerate() {
@@ -2447,7 +2420,7 @@ mod tests {
         PackageIndex::from(packages)
       }
 
-      /// Plans a batch for `desired` (naming `explicit`) and runs it.
+      /// Like [`Self::try_install`], asserting that nothing failed.
       fn install(
         &mut self,
         index: &PackageIndex,
@@ -2455,33 +2428,15 @@ mod tests {
         explicit: &[&str],
         force: bool,
       ) -> BatchOutcome {
-        let desired: Vec<String> = desired.iter().map(|s| s.to_string()).collect();
-        let explicit: Vec<String> = explicit.iter().map(|s| s.to_string()).collect();
-        let mut batch = plan_install_batch(self.target.path(), &desired, &explicit).unwrap();
-
-        batch.force = force;
-        self.clock += 1;
-
-        let outcome = self
-          .rt
-          .block_on(install_batch(
-            self.target.path(),
-            self.cache_base.path(),
-            &self.eco,
-            index,
-            &self.client,
-            "valheim",
-            &batch,
-            self.clock,
-          ))
-          .unwrap();
+        let outcome = self.try_install(index, desired, explicit, force);
 
         assert!(outcome.is_ok(), "batch failed: {:?}", outcome.failed);
 
         outcome
       }
 
-      /// Like [`Self::install`], without asserting that nothing failed.
+      /// Plans a batch for `desired` (naming `explicit`) and runs it, without
+      /// asserting that nothing failed.
       fn try_install(
         &mut self,
         index: &PackageIndex,
@@ -3045,7 +3000,7 @@ mod tests {
     #[test]
     fn a_pinned_install_lands_the_requested_version_not_the_latest() {
       let mut repo = Repo::new();
-      let index = repo.publish_history(&mod_history());
+      let index = repo.publish(&mod_history());
       let dll = repo.path("BepInEx/plugins/Author-Mod/Mod.dll");
 
       let outcome = repo.install(&index, &["Author-Mod-1.0.0"], &["Author-Mod-1.0.0"], false);
@@ -3068,7 +3023,7 @@ mod tests {
     #[test]
     fn a_pin_holds_for_another_item_in_the_batch_that_depends_on_it() {
       let mut repo = Repo::new();
-      let index = repo.publish_history(&[
+      let index = repo.publish(&[
         Pkg {
           full_name: DEP,
           version: "1.0.0",
@@ -3100,14 +3055,17 @@ mod tests {
     #[test]
     fn a_missing_pinned_version_fails_rather_than_installing_the_latest() {
       let mut repo = Repo::new();
-      let index = repo.publish_history(&mod_history());
+      let index = repo.publish(&mod_history());
       let outcome = repo.try_install(&index, &["Author-Mod-9.9.9"], &["Author-Mod-9.9.9"], false);
 
       assert!(outcome.succeeded.is_empty());
       assert_eq!(outcome.failed.len(), 1);
       assert_eq!(outcome.failed[0].0, "Author-Mod-9.9.9");
       assert!(
-        outcome.failed[0].1.to_string().contains("Author-Mod-9.9.9"),
+        outcome.failed[0]
+          .1
+          .to_string()
+          .contains("Author-Mod has no version 9.9.9"),
         "{}",
         outcome.failed[0].1
       );
@@ -3121,7 +3079,7 @@ mod tests {
     #[test]
     fn naming_a_disabled_mod_with_a_version_enables_it() {
       let mut repo = Repo::new();
-      let index = repo.publish_history(&mod_history());
+      let index = repo.publish(&mod_history());
 
       repo.install(&index, &["Author-Mod-1.0.0"], &["Author-Mod-1.0.0"], false);
       set_enabled_in(repo.target.path(), &repo.eco, "valheim", MOD, false).unwrap();

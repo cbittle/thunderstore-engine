@@ -327,7 +327,7 @@ impl PackageIndex {
     let (ver_start, ver_end) = *self.version_ranges.get(idx)?;
 
     (ver_start..ver_end).find(|&ver_idx| {
-      resolve_option(&self.interner, self.versions.version_numbers[ver_idx]).as_deref()
+      self.versions.version_numbers[ver_idx].map(|key| self.interner.resolve(&key))
         == Some(version_number)
     })
   }
@@ -696,9 +696,10 @@ pub struct Resolution {
   /// (requested or dependency) that resolved to a version in the index.
   pub urls: HashMap<String, String>,
   /// The `Owner-Name` identifiers that were requested (directly or as a
-  /// dependency) but not present in the index, sorted and deduplicated. An
-  /// unsatisfiable pin is listed as `Owner-Name-Version`. A non-empty list
-  /// means the resulting install is incomplete.
+  /// dependency) but not present in the index, sorted and deduplicated. A pin
+  /// to a version the package does not publish, or conflicting pins, are listed
+  /// as `Owner-Name-Version` instead. A non-empty list means the resulting
+  /// install is incomplete.
   pub unresolved: Vec<String>,
 }
 
@@ -749,11 +750,12 @@ impl DependencyGraph {
   ///
   /// # Limitations
   ///
-  /// Resolution is version-agnostic. The version suffix of a dependency string
-  /// (e.g. the `1.2.3` in `Owner-Mod-1.2.3`) is discarded and every package
-  /// resolves to its *latest* available version unless the caller pinned it.
-  /// There is no version-constraint solving, so a package pinned to an older
-  /// dependency will still receive the latest one.
+  /// The version suffix of a dependency string (e.g. the `1.2.3` in
+  /// `Owner-Mod-1.2.3`) is discarded, so every package resolves to its *latest*
+  /// available version unless a requested `Owner-Name-Version` or a
+  /// [`pins`](Self::pins) entry names one. There is no version-constraint
+  /// solving: a package whose manifest depends on an older version of another
+  /// still receives the latest one.
   ///
   /// A requested package or dependency that is absent from `index` is silently
   /// skipped here; use [`resolve_report`](Self::resolve_report) to learn which
@@ -1300,9 +1302,11 @@ mod tests {
     dependencies: Vec<String>,
   ) -> Package {
     let mut pkg = create_test_package(name, owner, version);
+
     if let Some(latest_version) = pkg.versions.first_mut() {
       latest_version.dependencies = dependencies;
     }
+
     pkg
   }
 
@@ -2379,6 +2383,7 @@ mod tests {
         ..template.clone()
       })
       .collect();
+
     pkg
   }
 
@@ -2408,6 +2413,7 @@ mod tests {
     let mut keys: Vec<&str> = urls.keys().map(String::as_str).collect();
 
     keys.sort();
+
     keys
   }
 
