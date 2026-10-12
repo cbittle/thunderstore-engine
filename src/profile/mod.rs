@@ -212,7 +212,11 @@ pub fn plan_install_batch(
     .iter()
     .filter(|entry| !entry.enabled)
     .map(|entry| entry.name.clone())
-    .partition(|name| explicit.contains(name));
+    .partition(|name| {
+      explicit
+        .iter()
+        .any(|requested| crate::util::full_name_prefix(requested) == name.as_str())
+    });
 
   Ok(InstallBatch {
     desired: desired.to_vec(),
@@ -636,14 +640,28 @@ async fn install_one(
   client: &ThunderstoreClient,
   game: &str,
   full_name: &str,
+  pins: &[String],
   force: bool,
   installed_at_time: u64,
 ) -> Result<(Vec<String>, Vec<String>)> {
-  let resolution = DependencyGraph::new(vec![full_name.to_string()]).resolve_report(index);
+  let resolution = DependencyGraph::new(vec![full_name.to_string()])
+    .pins(pins.iter().cloned())
+    .resolve_report(index);
+
+  // A pinned version the package does not publish stops resolution before any
+  // dependency is reached, so the request itself is the only entry.
+  if let [unresolved] = resolution.unresolved.as_slice()
+    && unresolved == full_name
+    && let Some((name, version)) = crate::util::split_version(full_name)
+  {
+    return Err(Error::Profile(format!(
+      "cannot install {full_name}: {name} has no version {version}"
+    )));
+  }
 
   if !resolution.unresolved.is_empty() {
     return Err(Error::Profile(format!(
-      "cannot install {full_name}: unresolved dependencies: {}",
+      "cannot install {full_name}: could not resolve {}",
       resolution.unresolved.join(", ")
     )));
   }
@@ -766,6 +784,9 @@ fn recorded_files_present(
 /// say which ones. The disabled-state restore runs regardless, since items
 /// installed before a failure are already enabled. A requested enable that
 /// fails is recorded the same way.
+///
+/// A `desired` entry of `Owner-Name-Version` installs exactly that version, and
+/// the pin holds for the rest of the batch.
 #[allow(clippy::too_many_arguments)]
 pub async fn install_batch(
   target_dir: &Path,
@@ -788,6 +809,7 @@ pub async fn install_batch(
       client,
       game,
       full_name,
+      &batch.desired,
       batch.force,
       installed_at_time,
     )
@@ -2348,12 +2370,12 @@ mod tests {
         }
       }
 
-      /// Serves each package's archive and returns an index in which that
-      /// version is the only, and so the latest, one.
+      /// Serves each package's archive and returns an index of them. Versions of
+      /// one package are published in slice order, so the last is the latest.
       fn publish(&mut self, pkgs: &[Pkg<'_>]) -> PackageIndex {
-        let mut packages = Vec::new();
+        let mut packages: Vec<serde_json::Value> = Vec::new();
 
-        for pkg in pkgs {
+        for (day, pkg) in pkgs.iter().enumerate() {
           let path = format!("/dl/{}-{}.zip", pkg.full_name, pkg.version);
           let mock = self
             .server
@@ -2366,29 +2388,56 @@ mod tests {
           self.mocks.push(mock);
 
           let (owner, name) = pkg.full_name.split_once('-').unwrap();
-          let json = serde_json::json!({
-            "name": name, "full_name": pkg.full_name, "owner": owner,
-            "package_url": "https://example.com", "date_created": "2024-01-01T12:00:00Z",
-            "date_updated": "2024-01-02T12:00:00Z", "uuid4": "pkg", "rating_score": 1,
-            "is_pinned": false, "is_deprecated": false, "has_nsfw_content": false,
-            "categories": [],
-            "versions": [{
-              "name": name, "full_name": pkg.full_name, "description": "d", "icon": "i",
-              "version_number": pkg.version, "dependencies": pkg.deps,
-              "download_url": format!("{}{path}", self.server.url()), "downloads": 1,
-              "date_created": "2024-01-01T12:00:00Z", "website_url": "", "is_active": true,
-              "uuid4": "ver", "file_size": 1
-            }]
+          let created = format!("2024-01-{:02}T12:00:00Z", day + 1);
+          let version = serde_json::json!({
+            "name": name, "full_name": pkg.full_name, "description": "d", "icon": "i",
+            "version_number": pkg.version, "dependencies": pkg.deps,
+            "download_url": format!("{}{path}", self.server.url()), "downloads": 1,
+            "date_created": created, "website_url": "", "is_active": true,
+            "uuid4": "ver", "file_size": 1
           });
 
-          packages.push(serde_json::from_value::<Package>(json).unwrap());
+          match packages
+            .iter_mut()
+            .find(|p| p["full_name"] == pkg.full_name)
+          {
+            Some(package) => package["versions"].as_array_mut().unwrap().push(version),
+            None => packages.push(serde_json::json!({
+              "name": name, "full_name": pkg.full_name, "owner": owner,
+              "package_url": "https://example.com", "date_created": "2024-01-01T12:00:00Z",
+              "date_updated": "2024-01-02T12:00:00Z", "uuid4": "pkg", "rating_score": 1,
+              "is_pinned": false, "is_deprecated": false, "has_nsfw_content": false,
+              "categories": [], "versions": [version]
+            })),
+          }
         }
+
+        let packages = packages
+          .into_iter()
+          .map(|json| serde_json::from_value::<Package>(json).unwrap())
+          .collect::<Vec<_>>();
 
         PackageIndex::from(packages)
       }
 
-      /// Plans a batch for `desired` (naming `explicit`) and runs it.
+      /// Like [`Self::try_install`], asserting that nothing failed.
       fn install(
+        &mut self,
+        index: &PackageIndex,
+        desired: &[&str],
+        explicit: &[&str],
+        force: bool,
+      ) -> BatchOutcome {
+        let outcome = self.try_install(index, desired, explicit, force);
+
+        assert!(outcome.is_ok(), "batch failed: {:?}", outcome.failed);
+
+        outcome
+      }
+
+      /// Plans a batch for `desired` (naming `explicit`) and runs it, without
+      /// asserting that nothing failed.
+      fn try_install(
         &mut self,
         index: &PackageIndex,
         desired: &[&str],
@@ -2402,7 +2451,7 @@ mod tests {
         batch.force = force;
         self.clock += 1;
 
-        let outcome = self
+        self
           .rt
           .block_on(install_batch(
             self.target.path(),
@@ -2414,11 +2463,7 @@ mod tests {
             &batch,
             self.clock,
           ))
-          .unwrap();
-
-        assert!(outcome.is_ok(), "batch failed: {:?}", outcome.failed);
-
-        outcome
+          .unwrap()
       }
 
       fn path(&self, rel: &str) -> PathBuf {
@@ -2933,6 +2978,118 @@ mod tests {
 
       assert!(modlist::read(repo.target.path()).unwrap().is_empty());
       assert!(!state_file_path(repo.target.path(), LOADER).exists());
+    }
+
+    fn mod_history<'a>() -> [Pkg<'a>; 2] {
+      [
+        Pkg {
+          full_name: MOD,
+          version: "1.0.0",
+          deps: &[],
+          files: &[("plugins/Mod.dll", b"v1")],
+        },
+        Pkg {
+          full_name: MOD,
+          version: "2.0.0",
+          deps: &[],
+          files: &[("plugins/Mod.dll", b"v2")],
+        },
+      ]
+    }
+
+    #[test]
+    fn a_pinned_install_lands_the_requested_version_not_the_latest() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&mod_history());
+      let dll = repo.path("BepInEx/plugins/Author-Mod/Mod.dll");
+
+      let outcome = repo.install(&index, &["Author-Mod-1.0.0"], &["Author-Mod-1.0.0"], false);
+
+      assert_eq!(outcome.succeeded, names(&[MOD]));
+      assert_eq!(repo.entry(MOD).version_number.to_string(), "1.0.0");
+      assert_eq!(std::fs::read(&dll).unwrap(), b"v1");
+
+      repo.install(&index, &[MOD], &[MOD], false);
+
+      assert_eq!(repo.entry(MOD).version_number.to_string(), "2.0.0");
+      assert_eq!(std::fs::read(&dll).unwrap(), b"v2");
+
+      repo.install(&index, &["Author-Mod-1.0.0"], &["Author-Mod-1.0.0"], false);
+
+      assert_eq!(repo.entry(MOD).version_number.to_string(), "1.0.0");
+      assert_eq!(std::fs::read(&dll).unwrap(), b"v1");
+    }
+
+    #[test]
+    fn a_pin_holds_for_another_item_in_the_batch_that_depends_on_it() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&[
+        Pkg {
+          full_name: DEP,
+          version: "1.0.0",
+          deps: &[],
+          files: &[("plugins/Dep.dll", b"dep1")],
+        },
+        Pkg {
+          full_name: DEP,
+          version: "2.0.0",
+          deps: &[],
+          files: &[("plugins/Dep.dll", b"dep2")],
+        },
+        Pkg {
+          full_name: MOD,
+          version: "1.0.0",
+          deps: &["Author-Dep-2.0.0"],
+          files: &[("plugins/Mod.dll", b"v1")],
+        },
+      ]);
+
+      let desired = ["Author-Dep-1.0.0", MOD];
+
+      repo.install(&index, &desired, &desired, false);
+
+      assert_eq!(repo.entry(DEP).version_number.to_string(), "1.0.0");
+      assert_eq!(repo.entry(MOD).version_number.to_string(), "1.0.0");
+    }
+
+    #[test]
+    fn a_missing_pinned_version_fails_rather_than_installing_the_latest() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&mod_history());
+      let outcome = repo.try_install(&index, &["Author-Mod-9.9.9"], &["Author-Mod-9.9.9"], false);
+
+      assert!(outcome.succeeded.is_empty());
+      assert_eq!(outcome.failed.len(), 1);
+      assert_eq!(outcome.failed[0].0, "Author-Mod-9.9.9");
+      assert!(
+        outcome.failed[0]
+          .1
+          .to_string()
+          .contains("Author-Mod has no version 9.9.9"),
+        "{}",
+        outcome.failed[0].1
+      );
+      assert!(
+        modlist::read(repo.target.path())
+          .unwrap_or_default()
+          .is_empty()
+      );
+    }
+
+    #[test]
+    fn naming_a_disabled_mod_with_a_version_enables_it() {
+      let mut repo = Repo::new();
+      let index = repo.publish(&mod_history());
+
+      repo.install(&index, &["Author-Mod-1.0.0"], &["Author-Mod-1.0.0"], false);
+      set_enabled_in(repo.target.path(), &repo.eco, "valheim", MOD, false).unwrap();
+
+      assert!(!repo.entry(MOD).enabled);
+
+      let outcome = repo.install(&index, &["Author-Mod-1.0.0"], &["Author-Mod-1.0.0"], false);
+
+      assert_eq!(outcome.unchanged, names(&[MOD]));
+      assert!(repo.entry(MOD).enabled);
     }
   }
 }

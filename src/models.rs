@@ -322,6 +322,16 @@ impl PackageIndex {
     (ver_start..ver_end).max_by_key(|&ver_idx| self.versions.dates_created[ver_idx])
   }
 
+  /// Returns the index of the package at `idx`'s version `version_number`.
+  pub(crate) fn get_version_at(&self, idx: usize, version_number: &str) -> Option<usize> {
+    let (ver_start, ver_end) = *self.version_ranges.get(idx)?;
+
+    (ver_start..ver_end).find(|&ver_idx| {
+      self.versions.version_numbers[ver_idx].map(|key| self.interner.resolve(&key))
+        == Some(version_number)
+    })
+  }
+
   /// Builds a map from each package's full name (`Owner-Name`) to its index,
   /// for repeated by-name lookups.
   pub fn build_name_index(&self) -> HashMap<String, usize> {
@@ -686,8 +696,10 @@ pub struct Resolution {
   /// (requested or dependency) that resolved to a version in the index.
   pub urls: HashMap<String, String>,
   /// The `Owner-Name` identifiers that were requested (directly or as a
-  /// dependency) but not present in the index, sorted and deduplicated. A
-  /// non-empty list means the resulting install is incomplete.
+  /// dependency) but not present in the index, sorted and deduplicated. A pin
+  /// to a version the package does not publish, or conflicting pins, are listed
+  /// as `Owner-Name-Version` instead. A non-empty list means the resulting
+  /// install is incomplete.
   pub unresolved: Vec<String>,
 }
 
@@ -699,16 +711,30 @@ pub struct Resolution {
 pub struct DependencyGraph {
   /// The list of package names that the user wants to install
   install_packages: Vec<String>,
+  /// Versions to hold packages at, without requesting them
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pins: Vec<String>,
 }
 
 impl DependencyGraph {
   /// Creates a graph seeded with the packages a caller asked for.
   ///
-  /// Names are `Owner-Name`; a trailing `-Version` is accepted but discarded
-  /// during resolution (see [`resolve`](Self::resolve)'s limitations). Nothing is
-  /// validated here, so an unknown name surfaces only at resolution time.
+  /// Names are `Owner-Name`, or `Owner-Name-Version` to install exactly that
+  /// version. Nothing is validated here, so an unknown name surfaces only at
+  /// resolution time.
   pub fn new(install_packages: Vec<String>) -> Self {
-    Self { install_packages }
+    Self {
+      install_packages,
+      pins: Vec::new(),
+    }
+  }
+
+  /// Holds packages at `Owner-Name-Version` if resolution reaches them.
+  /// Entries without a version are ignored.
+  pub fn pins(mut self, pins: impl IntoIterator<Item = String>) -> Self {
+    self.pins.extend(pins);
+
+    self
   }
 
   /// Resolves all dependencies for the requested packages against the package index.
@@ -724,11 +750,12 @@ impl DependencyGraph {
   ///
   /// # Limitations
   ///
-  /// Resolution is version-agnostic. The version suffix of a dependency string
-  /// (e.g. the `1.2.3` in `Owner-Mod-1.2.3`) is discarded and every package
-  /// resolves to its *latest* available version. There is no version-constraint
-  /// solving, so a package pinned to an older dependency will still receive the
-  /// latest one.
+  /// The version suffix of a dependency string (e.g. the `1.2.3` in
+  /// `Owner-Mod-1.2.3`) is discarded, so every package resolves to its *latest*
+  /// available version unless a requested `Owner-Name-Version` or a
+  /// [`pins`](Self::pins) entry names one. There is no version-constraint
+  /// solving: a package whose manifest depends on an older version of another
+  /// still receives the latest one.
   ///
   /// A requested package or dependency that is absent from `index` is silently
   /// skipped here; use [`resolve_report`](Self::resolve_report) to learn which
@@ -756,6 +783,14 @@ impl DependencyGraph {
     let mut seen: HashSet<usize> = HashSet::new();
     let mut unresolved: Vec<String> = Vec::new();
 
+    let mut pins: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+
+    for full_name in self.install_packages.iter().chain(&self.pins) {
+      if let Some((name, version)) = crate::util::split_version(full_name) {
+        pins.entry(name).or_default().insert(version);
+      }
+    }
+
     tracing::debug!("Starting with mod list of: {:#?}", sorted_set);
 
     while !sorted_set.is_empty() {
@@ -781,10 +816,41 @@ impl DependencyGraph {
         continue;
       }
 
-      if let Some(latest_ver_idx) = index.get_latest_version_at(pkg_idx) {
+      let chosen_ver_idx = match pins.get(item.as_str()) {
+        None => index.get_latest_version_at(pkg_idx),
+        Some(versions) if versions.len() > 1 => {
+          tracing::warn!(
+            "package {:?} is pinned to more than one version ({:?}); the install will be incomplete",
+            item,
+            versions
+          );
+          unresolved.extend(versions.iter().map(|version| format!("{item}-{version}")));
+
+          continue;
+        }
+        Some(versions) => {
+          let version = versions.first().copied().unwrap_or_default();
+
+          match index.get_version_at(pkg_idx, version) {
+            Some(ver_idx) => Some(ver_idx),
+            None => {
+              tracing::warn!(
+                "package {:?} has no version {:?}; the install will be incomplete",
+                item,
+                version
+              );
+              unresolved.push(format!("{item}-{version}"));
+
+              continue;
+            }
+          }
+        }
+      };
+
+      if let Some(chosen_ver_idx) = chosen_ver_idx {
         let deps = resolve_vec(
           &index.interner,
-          &index.versions.dependencies[latest_ver_idx],
+          &index.versions.dependencies[chosen_ver_idx],
         );
 
         for dep in deps {
@@ -797,20 +863,20 @@ impl DependencyGraph {
         }
       }
 
-      install_indices.push(pkg_idx);
+      install_indices.push((pkg_idx, chosen_ver_idx));
     }
 
     let mut urls = HashMap::new();
 
-    for &idx in &install_indices {
-      if let Some((zip_name, url)) = Self::package_zip_and_url(index, idx) {
+    for &(idx, chosen_ver_idx) in &install_indices {
+      if let Some((zip_name, url)) = Self::package_zip_and_url(index, idx, chosen_ver_idx) {
         urls.insert(zip_name, url);
       } else if let Some(name) = index
         .resolve_full_name_at(idx)
         .or_else(|| index.resolve_name_at(idx))
       {
         // Found in the index but with no downloadable version (no versions, or a
-        // latest lacking a URL/version number): it is part of the desired set yet
+        // version lacking a URL/version number): it is part of the desired set yet
         // yields no download, so report it rather than dropping it silently.
         tracing::warn!(
           "package {:?} has no downloadable version; the install will be incomplete",
@@ -828,16 +894,20 @@ impl DependencyGraph {
 
   /// Resolves one package index to its `(zip_filename, download_url)`, or `None`
   /// when the package has no version that can be downloaded — it has no versions,
-  /// or its latest version is missing a download URL or version number.
-  fn package_zip_and_url(index: &PackageIndex, idx: usize) -> Option<(String, String)> {
-    let latest_ver_idx = index.get_latest_version_at(idx)?;
+  /// or its chosen version is missing a download URL or version number.
+  fn package_zip_and_url(
+    index: &PackageIndex,
+    idx: usize,
+    ver_idx: Option<usize>,
+  ) -> Option<(String, String)> {
+    let chosen_ver_idx = ver_idx?;
     let url = resolve_option(
       &index.interner,
-      index.versions.download_urls[latest_ver_idx],
+      index.versions.download_urls[chosen_ver_idx],
     )?;
     let version_number = resolve_option(
       &index.interner,
-      index.versions.version_numbers[latest_ver_idx],
+      index.versions.version_numbers[chosen_ver_idx],
     )?;
     let package_name = index.resolve_full_name_at(idx)?;
     let zip_name = format!("{}-{}.zip", package_name, version_number);
@@ -1232,9 +1302,11 @@ mod tests {
     dependencies: Vec<String>,
   ) -> Package {
     let mut pkg = create_test_package(name, owner, version);
+
     if let Some(latest_version) = pkg.versions.first_mut() {
       latest_version.dependencies = dependencies;
     }
+
     pkg
   }
 
@@ -2287,6 +2359,183 @@ mod tests {
     assert_eq!(result.len(), 1);
 
     assert!(result.contains_key("Owner1-ModA-1.0.0.zip"));
+  }
+
+  /// A package whose versions are published in slice order (last is latest).
+  fn create_test_package_with_versions(
+    name: &str,
+    owner: &str,
+    versions: &[(&str, &[&str])],
+  ) -> Package {
+    let mut pkg = create_test_package(name, owner, versions[0].0);
+    let template = pkg.versions[0].clone();
+    let start =
+      OffsetDateTime::now_utc().saturating_sub(time::Duration::days(versions.len() as i64));
+
+    pkg.versions = versions
+      .iter()
+      .enumerate()
+      .map(|(day, (version, deps))| Version {
+        version_number: Some(version.to_string()),
+        dependencies: deps.iter().map(|d| d.to_string()).collect(),
+        download_url: Some(format!("https://example.com/{name}/{version}")),
+        date_created: start.saturating_add(time::Duration::days(day as i64)),
+        ..template.clone()
+      })
+      .collect();
+
+    pkg
+  }
+
+  fn pinning_index() -> PackageIndex {
+    vec![
+      create_test_package_with_versions(
+        "ModA",
+        "Owner1",
+        &[
+          ("1.0.0", &["Owner4-ModD-0.9.0"]),
+          ("2.0.0", &["Owner3-ModC-1.5.0"]),
+        ],
+      ),
+      create_test_package_with_dependencies(
+        "ModB",
+        "Owner2",
+        "1.0.0",
+        vec!["Owner1-ModA-1.0.0".to_string()],
+      ),
+      create_test_package("ModC", "Owner3", "1.5.0"),
+      create_test_package("ModD", "Owner4", "0.9.0"),
+    ]
+    .into()
+  }
+
+  fn sorted_keys(urls: &HashMap<String, String>) -> Vec<&str> {
+    let mut keys: Vec<&str> = urls.keys().map(String::as_str).collect();
+
+    keys.sort();
+
+    keys
+  }
+
+  #[test]
+  fn test_resolve_pinned_version_uses_that_version_and_its_dependencies() {
+    let report =
+      DependencyGraph::new(vec!["Owner1-ModA-1.0.0".to_string()]).resolve_report(&pinning_index());
+
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+      sorted_keys(&report.urls),
+      ["Owner1-ModA-1.0.0.zip", "Owner4-ModD-0.9.0.zip"]
+    );
+    assert_eq!(
+      report.urls["Owner1-ModA-1.0.0.zip"],
+      "https://example.com/ModA/1.0.0"
+    );
+  }
+
+  #[test]
+  fn test_resolve_bare_name_still_resolves_latest() {
+    let report =
+      DependencyGraph::new(vec!["Owner1-ModA".to_string()]).resolve_report(&pinning_index());
+
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+      sorted_keys(&report.urls),
+      ["Owner1-ModA-2.0.0.zip", "Owner3-ModC-1.5.0.zip"]
+    );
+  }
+
+  #[test]
+  fn test_resolve_missing_pinned_version_is_unresolved_not_latest() {
+    let report =
+      DependencyGraph::new(vec!["Owner1-ModA-9.9.9".to_string()]).resolve_report(&pinning_index());
+
+    assert!(report.urls.is_empty());
+    assert_eq!(report.unresolved, vec!["Owner1-ModA-9.9.9".to_string()]);
+  }
+
+  #[test]
+  fn test_resolve_dependency_string_version_is_not_a_pin() {
+    let report =
+      DependencyGraph::new(vec!["Owner2-ModB".to_string()]).resolve_report(&pinning_index());
+
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+      sorted_keys(&report.urls),
+      [
+        "Owner1-ModA-2.0.0.zip",
+        "Owner2-ModB-1.0.0.zip",
+        "Owner3-ModC-1.5.0.zip"
+      ]
+    );
+  }
+
+  #[test]
+  fn test_resolve_pin_on_a_dependency_wins_over_latest() {
+    let requested = DependencyGraph::new(vec![
+      "Owner2-ModB".to_string(),
+      "Owner1-ModA-1.0.0".to_string(),
+    ])
+    .resolve_report(&pinning_index());
+    let pinned_only = DependencyGraph::new(vec!["Owner2-ModB".to_string()])
+      .pins(["Owner1-ModA-1.0.0".to_string()])
+      .resolve_report(&pinning_index());
+
+    for report in [requested, pinned_only] {
+      assert!(report.unresolved.is_empty());
+      assert_eq!(
+        sorted_keys(&report.urls),
+        [
+          "Owner1-ModA-1.0.0.zip",
+          "Owner2-ModB-1.0.0.zip",
+          "Owner4-ModD-0.9.0.zip"
+        ]
+      );
+    }
+  }
+
+  #[test]
+  fn test_resolve_pin_wins_over_a_bare_request_for_the_same_package() {
+    let report = DependencyGraph::new(vec![
+      "Owner1-ModA".to_string(),
+      "Owner1-ModA-1.0.0".to_string(),
+    ])
+    .resolve_report(&pinning_index());
+
+    assert!(report.unresolved.is_empty());
+    assert_eq!(
+      sorted_keys(&report.urls),
+      ["Owner1-ModA-1.0.0.zip", "Owner4-ModD-0.9.0.zip"]
+    );
+  }
+
+  #[test]
+  fn test_resolve_conflicting_pins_leave_the_package_unresolved() {
+    let report = DependencyGraph::new(vec![
+      "Owner2-ModB".to_string(),
+      "Owner1-ModA-2.0.0".to_string(),
+    ])
+    .pins(["Owner1-ModA-1.0.0".to_string()])
+    .resolve_report(&pinning_index());
+
+    assert_eq!(
+      report.unresolved,
+      vec![
+        "Owner1-ModA-1.0.0".to_string(),
+        "Owner1-ModA-2.0.0".to_string()
+      ]
+    );
+    assert_eq!(sorted_keys(&report.urls), ["Owner2-ModB-1.0.0.zip"]);
+  }
+
+  #[test]
+  fn test_resolve_ignores_unversioned_and_unreached_pins() {
+    let report = DependencyGraph::new(vec!["Owner3-ModC".to_string()])
+      .pins(["Owner1-ModA".to_string(), "Owner1-ModA-9.9.9".to_string()])
+      .resolve_report(&pinning_index());
+
+    assert!(report.unresolved.is_empty());
+    assert_eq!(sorted_keys(&report.urls), ["Owner3-ModC-1.5.0.zip"]);
   }
 
   #[test]
