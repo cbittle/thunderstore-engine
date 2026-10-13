@@ -113,9 +113,9 @@ fn export_then_import_round_trips_into_a_new_target() {
 }
 
 /// A mod that fails stops an import before its configs are extracted, so the
-/// error has to say the import is unfinished and that retrying completes it.
+/// error has to say the import is unfinished.
 #[test]
-fn a_failed_import_tells_the_user_to_retry_to_finish_it() {
+fn a_failed_import_tells_the_user_it_is_unfinished() {
   let mut server = Server::new();
 
   let _dl = server
@@ -178,7 +178,7 @@ fn a_failed_import_tells_the_user_to_retry_to_finish_it() {
     .to_string();
 
   assert!(error.contains("Author-CoolMod"), "{error}");
-  assert!(error.contains("retry the import"), "{error}");
+  assert!(error.contains("the import is unfinished"), "{error}");
 }
 
 /// `import_in` has to route one source string to the same place a caller
@@ -259,7 +259,6 @@ fn import_in_routes_a_file_path_and_a_directory_from_the_source_string_alone() {
   assert_eq!(outcome.installed, vec!["Author-CoolMod".to_string()]);
   assert!(outcome.unchanged.is_empty());
   assert!(outcome.reinstalled.is_empty());
-  assert!(outcome.source.preserves_versions());
   assert!(
     from_file
       .join("BepInEx/plugins/Author-CoolMod/CoolMod.dll")
@@ -287,7 +286,6 @@ fn import_in_routes_a_file_path_and_a_directory_from_the_source_string_alone() {
   );
   assert_eq!(outcome.installed, vec!["Author-CoolMod".to_string()]);
   assert!(outcome.unchanged.is_empty());
-  assert!(outcome.source.preserves_versions());
   assert!(
     from_dir
       .join("BepInEx/plugins/Author-CoolMod/CoolMod.dll")
@@ -1576,7 +1574,11 @@ fn index_json_two_versions(server_url: &str) -> String {
 }
 
 /// A bare `.r2x` naming `Author-CoolMod` at `version_number`.
-fn export_at(index: &thunderstore_engine::models::PackageIndex, version_number: &str) -> String {
+fn export_at(
+  index: &thunderstore_engine::models::PackageIndex,
+  version_number: &str,
+  enabled: bool,
+) -> String {
   let mut version = index
     .get_package_by_full_name("Author-CoolMod")
     .unwrap()
@@ -1587,7 +1589,10 @@ fn export_at(index: &thunderstore_engine::models::PackageIndex, version_number: 
 
   version.version_number = Some(version_number.to_string());
 
-  let entry = profile::mod_entry_from_version("Author-CoolMod", "Author", &version, 1);
+  let mut entry = profile::mod_entry_from_version("Author-CoolMod", "Author", &version, 1);
+
+  entry.enabled = enabled;
+
   let export = profile::portability::export_format_from_mods("Pinned", &[entry]);
 
   profile::portability::export_r2x_to_string(&export).unwrap()
@@ -1640,7 +1645,7 @@ fn import_installs_the_exported_version_not_the_latest() {
       &index,
       &client,
       "valheim",
-      export_at(&index, "1.0.0").as_bytes(),
+      export_at(&index, "1.0.0", true).as_bytes(),
       1,
     ))
     .unwrap();
@@ -1661,7 +1666,7 @@ fn import_installs_the_exported_version_not_the_latest() {
       &index,
       &client,
       "valheim",
-      export_at(&index, "9.9.9").as_bytes(),
+      export_at(&index, "9.9.9", true).as_bytes(),
       2,
     ))
     .unwrap_err();
@@ -1676,6 +1681,29 @@ fn import_installs_the_exported_version_not_the_latest() {
     profile::modlist::read(&missing)
       .unwrap_or_default()
       .is_empty()
+  );
+
+  // A disabled entry at a missing version reports the missing version, not
+  // that the mod it never installed cannot be disabled.
+  let missing_disabled = base.path().join("missing-disabled");
+  let error = rt
+    .block_on(profile::portability::import_r2z_in(
+      &missing_disabled,
+      base.path(),
+      &eco,
+      &index,
+      &client,
+      "valheim",
+      export_at(&index, "9.9.9", false).as_bytes(),
+      3,
+    ))
+    .unwrap_err();
+
+  assert!(
+    error
+      .to_string()
+      .contains("Author-CoolMod has no version 9.9.9"),
+    "{error}"
   );
 
   old_dl.assert();

@@ -634,15 +634,14 @@ pub fn extract_configs_in(target_dir: &Path, zip_bytes: &[u8]) -> Result<Vec<Pat
 ///    harmless because disabling renames a mod's files rather than
 ///    rewriting its config.
 ///
-/// **Installs the exported version, not the latest.** A version the index no
-/// longer has fails the import (see below).
+/// **Installs the exported version, not the latest.** A mod or version the
+/// index no longer has fails the import.
 ///
 /// `cache_base` is the package cache root and must not be `target_dir` — see
 /// [`crate::profile::install_mod_in`]. Returns the identifiers the import
 /// covers, dependencies included, split into those it installed and those it
 /// skipped as already current, so importing a profile the target already
-/// matches reports every mod as unchanged. A listed mod the package index no
-/// longer has resolves to nothing to install and is in neither list.
+/// matches reports every mod as unchanged.
 #[allow(clippy::too_many_arguments)]
 pub async fn import_r2z_in(
   target_dir: &Path,
@@ -692,11 +691,13 @@ pub async fn import_r2z_in(
   .await?;
 
   // Configs are not extracted after a failure, so the import is unfinished.
-  // A retry skips the mods already installed and completes it.
+  // Importing again once the cause is fixed skips the mods already installed
+  // and completes it. A missing exported version is never fixed by a retry
+  // alone, so the message does not promise one will.
   if let Some((name, error)) = outcome.failed.into_iter().next() {
     return Err(Error::Profile(format!(
       "importing {name}: {error}; the import is unfinished (its config files were \
-       not restored), retry the import to finish it"
+       not restored)"
     )));
   }
 
@@ -1258,25 +1259,14 @@ impl ImportSource {
 
     Self::Code(source.to_string())
   }
-
-  /// Whether this route keeps the versions the source recorded.
-  ///
-  /// True for every route. An adoption still reinstalls an unrecorded loader at
-  /// latest, which is why [`ImportOutcome::reinstalled`] is reported separately.
-  ///
-  /// Exposed because it is the one thing a caller has to tell a user before they
-  /// wonder why a pinned version changed, and deriving it from the variant is
-  /// the sort of rule that goes stale in a client.
-  pub fn preserves_versions(&self) -> bool {
-    true
-  }
 }
 
 /// What an import installed, by which route.
 ///
-/// Carries `source` so a caller can word the outcome per route, e.g. disclosing
-/// that versions were not preserved, without classifying the source string a
-/// second time.
+/// Carries `source` so a caller can word the outcome per route without
+/// classifying the source string a second time. Every route keeps the versions
+/// the source recorded, except a loader an adoption reinstalls at latest; see
+/// [`Self::reinstalled`].
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ImportOutcome {
@@ -1499,18 +1489,6 @@ mod tests {
       ImportSource::classify("/no/such/path.r2z"),
       ImportSource::Code(_)
     ));
-  }
-
-  #[test]
-  fn import_source_reports_whether_versions_survive() {
-    let dir = tempfile::tempdir().unwrap();
-
-    // The distinction a caller has to disclose: adoption keeps the source's
-    // versions apart from a reinstalled loader, while the other two install
-    // each mod's exported version.
-    assert!(ImportSource::R2modmanDir(dir.path().to_path_buf()).preserves_versions());
-    assert!(ImportSource::Archive(dir.path().join("e.r2z")).preserves_versions());
-    assert!(ImportSource::Code("abc123".to_string()).preserves_versions());
   }
 
   #[test]
